@@ -1,3 +1,6 @@
+This is a fork of Raspberry Pi's fork of OpenOCD, which adds SMP FreeRTOS support.
+Original readme follows:
+
 # Welcome to OpenOCD!
 
 OpenOCD provides on-chip programming and debugging support with a
