@@ -12,6 +12,7 @@
 #include <helper/time_support.h>
 #include <jtag/jtag.h>
 #include "target/target.h"
+#include <target/smp.h>
 #include "rtos.h"
 #include "helper/log.h"
 #include "helper/types.h"
@@ -20,6 +21,7 @@
 #include "target/cortex_m.h"
 
 #define FREERTOS_MAX_PRIORITIES	63
+#define FREERTOS_MAX_CORES		8
 
 /* FIXME: none of the _width parameters are actually observed properly!
  * you WILL need to edit more if you actually attempt to target a 8/16/64
@@ -102,6 +104,7 @@ enum freertos_symbol_values {
 	FREERTOS_VAL_UX_CURRENT_NUMBER_OF_TASKS = 9,
 	FREERTOS_VAL_UX_TOP_USED_PRIORITY = 10,
 	FREERTOS_VAL_X_SCHEDULER_RUNNING = 11,
+	FREERTOS_VAL_PX_CURRENT_TCBS = 12,
 };
 
 struct symbols {
@@ -110,7 +113,7 @@ struct symbols {
 };
 
 static const struct symbols freertos_symbol_list[] = {
-	{ "pxCurrentTCB", false },
+	{ "pxCurrentTCB", true },   /* Optional: absent in SMP FreeRTOS builds */
 	{ "pxReadyTasksLists", false },
 	{ "xDelayedTaskList1", false },
 	{ "xDelayedTaskList2", false },
@@ -122,6 +125,7 @@ static const struct symbols freertos_symbol_list[] = {
 	{ "uxCurrentNumberOfTasks", false },
 	{ "uxTopUsedPriority", true }, /* Unavailable since v7.5.3 */
 	{ "xSchedulerRunning", false },
+	{ "pxCurrentTCBs", true },  /* Optional: present only in SMP FreeRTOS builds */
 	{ NULL, false }
 };
 
@@ -167,19 +171,61 @@ static int freertos_update_threads(struct rtos *rtos)
 	/* wipe out previous thread details if any */
 	rtos_free_threadlist(rtos);
 
-	/* read the current thread */
+	/* Determine SMP mode: SMP FreeRTOS uses pxCurrentTCBs[], single-core uses pxCurrentTCB */
+	bool smp_mode = (rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address != 0);
+	uint32_t current_tcbs[FREERTOS_MAX_CORES];
+	int num_cores = 1;
+	memset(current_tcbs, 0, sizeof(current_tcbs));
 	uint32_t pointer_casts_are_bad;
-	retval = target_read_u32(rtos->target,
-			rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
-			&pointer_casts_are_bad);
-	if (retval != ERROR_OK) {
-		LOG_ERROR("Error reading current thread in FreeRTOS thread list");
-		return retval;
+
+	if (smp_mode) {
+		/* Count the number of cores from the SMP target list */
+		if (rtos->target->smp) {
+			struct target_list *head;
+			num_cores = 0;
+			foreach_smp_target(head, rtos->target->smp_targets)
+				num_cores++;
+			if (num_cores < 1)
+				num_cores = 1;
+			if (num_cores > FREERTOS_MAX_CORES)
+				num_cores = FREERTOS_MAX_CORES;
+		}
+
+		/* Read the current TCB pointer for each core from pxCurrentTCBs[] */
+		rtos->current_thread = 0;
+		for (int i = 0; i < num_cores; i++) {
+			uint32_t tcb_ptr = 0;
+			retval = target_read_u32(rtos->target,
+					rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address +
+					i * param->pointer_width,
+					&tcb_ptr);
+			if (retval != ERROR_OK) {
+				LOG_ERROR("Error reading pxCurrentTCBs[%d] in FreeRTOS SMP", i);
+				return retval;
+			}
+			current_tcbs[i] = tcb_ptr;
+			LOG_DEBUG("FreeRTOS: Read pxCurrentTCBs[%d] at 0x%" PRIx64 ", value 0x%" PRIx32,
+					i,
+					rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address + i * param->pointer_width,
+					tcb_ptr);
+			if (rtos->current_thread == 0 && tcb_ptr != 0)
+				rtos->current_thread = tcb_ptr;
+		}
+	} else {
+		/* Single-core: read pxCurrentTCB */
+		retval = target_read_u32(rtos->target,
+				rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
+				&pointer_casts_are_bad);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("Error reading current thread in FreeRTOS thread list");
+			return retval;
+		}
+		rtos->current_thread = pointer_casts_are_bad;
+		current_tcbs[0] = pointer_casts_are_bad;
+		LOG_DEBUG("FreeRTOS: Read pxCurrentTCB at 0x%" PRIx64 ", value 0x%" PRIx64,
+				rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
+				rtos->current_thread);
 	}
-	rtos->current_thread = pointer_casts_are_bad;
-	LOG_DEBUG("FreeRTOS: Read pxCurrentTCB at 0x%" PRIx64 ", value 0x%" PRIx64,
-										rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
-										rtos->current_thread);
 
 	/* read scheduler running */
 	uint32_t scheduler_running;
@@ -352,14 +398,25 @@ static int freertos_update_threads(struct rtos *rtos)
 			strcpy(rtos->thread_details[tasks_found].thread_name_str, tmp_str);
 			rtos->thread_details[tasks_found].exists = true;
 
-			if (rtos->thread_details[tasks_found].threadid == rtos->current_thread) {
-				char running_str[] = "State: Running";
-				rtos->thread_details[tasks_found].extra_info_str = malloc(
-						sizeof(running_str));
-				strcpy(rtos->thread_details[tasks_found].extra_info_str,
-					running_str);
-			} else
-				rtos->thread_details[tasks_found].extra_info_str = NULL;
+			/* Mark the task as running on whichever core it is current for */
+			rtos->thread_details[tasks_found].extra_info_str = NULL;
+			for (int core = 0; core < num_cores; core++) {
+				if (current_tcbs[core] != 0 &&
+						rtos->thread_details[tasks_found].threadid == current_tcbs[core]) {
+					char running_str[32];
+					if (smp_mode && num_cores > 1)
+						snprintf(running_str, sizeof(running_str),
+								"State: Running (Core %d)", core);
+					else
+						snprintf(running_str, sizeof(running_str), "State: Running");
+					rtos->thread_details[tasks_found].extra_info_str =
+							malloc(strlen(running_str) + 1);
+					if (rtos->thread_details[tasks_found].extra_info_str)
+						strcpy(rtos->thread_details[tasks_found].extra_info_str,
+								running_str);
+					break;
+				}
+			}
 
 			tasks_found++;
 			list_thread_count--;
@@ -522,7 +579,9 @@ static int freertos_get_thread_ascii_info(struct rtos *rtos, threadid_t thread_i
 static bool freertos_detect_rtos(struct target *target)
 {
 	if ((target->rtos->symbols) &&
-			(target->rtos->symbols[FREERTOS_VAL_PX_READY_TASKS_LISTS].address != 0)) {
+			(target->rtos->symbols[FREERTOS_VAL_PX_READY_TASKS_LISTS].address != 0) &&
+			((target->rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address != 0) ||
+			 (target->rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address != 0))) {
 		/* looks like FreeRTOS */
 		return true;
 	}
