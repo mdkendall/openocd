@@ -114,3 +114,8 @@ GTAGS
 # A compile_commands.json can be generated using bear and will help tools such
 # as clangd to locate header files and use correct $CFLAGS
 compile_commands.json
+
+# Build artifacts
+install-sh
+_codeql_detected_source_root
+doc/openocd.info-*
