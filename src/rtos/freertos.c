@@ -38,7 +38,7 @@ struct freertos_params {
 	const unsigned char list_elem_content_offset;	/* offsetof(ListItem_t, pvOwner) */
 	const unsigned char thread_stack_offset;		/* offsetof(TCB_t, pxTopOfStack) */
 	const unsigned char thread_name_offset;			/* offsetof(TCB_t, pcTaskName) - single core */
-	const unsigned char thread_name_offset_smp;		/* offsetof(TCB_t, pcTaskName) - SMP (configNUMBER_OF_CORES > 1, configUSE_CORE_AFFINITY == 0) */
+	const unsigned char thread_name_offset_smp;		/* offsetof(TCB_t, pcTaskName) - SMP (configNUMBER_OF_CORES > 1, configUSE_CORE_AFFINITY == 1) */
 	const struct rtos_register_stacking *stacking_info_cm3;
 	const struct rtos_register_stacking *stacking_info_cm4f;
 	const struct rtos_register_stacking *stacking_info_cm4f_fpu;
@@ -55,7 +55,7 @@ static const struct freertos_params freertos_params_list[] = {
 	12,						/* list_elem_content_offset */
 	0,						/* thread_stack_offset; */
 	52,						/* thread_name_offset; */
-	60,						/* thread_name_offset_smp; */
+	64,						/* thread_name_offset_smp; */
 	&rtos_standard_cortex_m3_stacking,	/* stacking_info */
 	&rtos_standard_cortex_m4f_stacking,
 	&rtos_standard_cortex_m4f_fpu_stacking,
@@ -70,7 +70,7 @@ static const struct freertos_params freertos_params_list[] = {
 	12,						/* list_elem_content_offset */
 	0,						/* thread_stack_offset; */
 	52,						/* thread_name_offset; */
-	60,						/* thread_name_offset_smp; */
+	64,						/* thread_name_offset_smp; */
 	&rtos_standard_cortex_m3_stacking,	/* stacking_info */
 	&rtos_standard_cortex_m4f_stacking,
 	&rtos_standard_cortex_m4f_fpu_stacking,
