@@ -74,6 +74,79 @@ static const struct stack_register_offset rtos_standard_cortex_m4f_fpu_stack_off
 };
 
 
+/*
+ * Stack frame layout for the FreeRTOS ARM_NTZ port targeting ARMv8-M cores
+ * (e.g. RP2350 Cortex-M33).  PendSV_Handler saves, from lowest address:
+ *   [PSPLIM, EXC_RETURN, r4-r11]  (software-saved, 10 words = 0x28 bytes)
+ *   [r0-r3, r12, lr, pc, xpsr]    (hardware-saved basic frame, 8 words = 0x20 bytes)
+ * pxTopOfStack points at the PSPLIM word.
+ *
+ * With FPU extended frame, s16-s31 are pushed *before* the above block:
+ *   [s16-s31]                      (0x40 bytes)
+ *   [PSPLIM, EXC_RETURN, r4-r11]  (0x28 bytes)
+ *   [r0-r3, r12, lr, pc, xpsr, s0-s15, FPSCR, reserved]  (0x68 bytes)
+ */
+
+/* Non-FPU (or FPU not active): total 0x48 bytes */
+static const struct stack_register_offset rtos_standard_cortex_m33_stack_offsets[ARMV7M_NUM_CORE_REGS] = {
+	{ ARMV7M_R0,   0x28, 32 },		/* r0   */
+	{ ARMV7M_R1,   0x2c, 32 },		/* r1   */
+	{ ARMV7M_R2,   0x30, 32 },		/* r2   */
+	{ ARMV7M_R3,   0x34, 32 },		/* r3   */
+	{ ARMV7M_R4,   0x08, 32 },		/* r4   */
+	{ ARMV7M_R5,   0x0c, 32 },		/* r5   */
+	{ ARMV7M_R6,   0x10, 32 },		/* r6   */
+	{ ARMV7M_R7,   0x14, 32 },		/* r7   */
+	{ ARMV7M_R8,   0x18, 32 },		/* r8   */
+	{ ARMV7M_R9,   0x1c, 32 },		/* r9   */
+	{ ARMV7M_R10,  0x20, 32 },		/* r10  */
+	{ ARMV7M_R11,  0x24, 32 },		/* r11  */
+	{ ARMV7M_R12,  0x38, 32 },		/* r12  */
+	{ ARMV7M_R13,  -2,   32 },		/* sp   */
+	{ ARMV7M_R14,  0x3c, 32 },		/* lr   */
+	{ ARMV7M_PC,   0x40, 32 },		/* pc   */
+	{ ARMV7M_XPSR, 0x44, 32 },		/* xPSR */
+};
+
+/* FPU active (s16-s31 pushed before software frame): total 0xd0 bytes */
+static const struct stack_register_offset rtos_standard_cortex_m33_fpu_stack_offsets[] = {
+	{ ARMV7M_R0,   0x68, 32 },		/* r0   */
+	{ ARMV7M_R1,   0x6c, 32 },		/* r1   */
+	{ ARMV7M_R2,   0x70, 32 },		/* r2   */
+	{ ARMV7M_R3,   0x74, 32 },		/* r3   */
+	{ ARMV7M_R4,   0x48, 32 },		/* r4   */
+	{ ARMV7M_R5,   0x4c, 32 },		/* r5   */
+	{ ARMV7M_R6,   0x50, 32 },		/* r6   */
+	{ ARMV7M_R7,   0x54, 32 },		/* r7   */
+	{ ARMV7M_R8,   0x58, 32 },		/* r8   */
+	{ ARMV7M_R9,   0x5c, 32 },		/* r9   */
+	{ ARMV7M_R10,  0x60, 32 },		/* r10  */
+	{ ARMV7M_R11,  0x64, 32 },		/* r11  */
+	{ ARMV7M_R12,  0x78, 32 },		/* r12  */
+	{ ARMV7M_R13,  -2,   32 },		/* sp   */
+	{ ARMV7M_R14,  0x7c, 32 },		/* lr   */
+	{ ARMV7M_PC,   0x80, 32 },		/* pc   */
+	{ ARMV7M_XPSR, 0x84, 32 },		/* xPSR */
+};
+
+static target_addr_t rtos_standard_cortex_m33_stack_align(struct target *target,
+	const uint8_t *stack_data, const struct rtos_register_stacking *stacking,
+	target_addr_t stack_ptr)
+{
+	const int XPSR_OFFSET = 0x44;
+	return rtos_cortex_m_stack_align(target, stack_data, stacking,
+		stack_ptr, XPSR_OFFSET);
+}
+
+static target_addr_t rtos_standard_cortex_m33_fpu_stack_align(struct target *target,
+	const uint8_t *stack_data, const struct rtos_register_stacking *stacking,
+	target_addr_t stack_ptr)
+{
+	const int XPSR_OFFSET = 0x84;
+	return rtos_cortex_m_stack_align(target, stack_data, stacking,
+		stack_ptr, XPSR_OFFSET);
+}
+
 static const struct stack_register_offset rtos_standard_cortex_r4_stack_offsets[] = {
 	{ 0,  0x08, 32 },		/* r0  (a1)   */
 	{ 1,  0x0c, 32 },		/* r1  (a2)  */
@@ -219,6 +292,22 @@ const struct rtos_register_stacking rtos_standard_cortex_m4f_fpu_stacking = {
 	.num_output_registers = ARMV7M_NUM_CORE_REGS,
 	.calculate_process_stack = rtos_standard_cortex_m4f_fpu_stack_align,
 	.register_offsets = rtos_standard_cortex_m4f_fpu_stack_offsets
+};
+
+const struct rtos_register_stacking rtos_standard_cortex_m33_stacking = {
+	.stack_registers_size = 0x48,
+	.stack_growth_direction = -1,
+	.num_output_registers = ARMV7M_NUM_CORE_REGS,
+	.calculate_process_stack = rtos_standard_cortex_m33_stack_align,
+	.register_offsets = rtos_standard_cortex_m33_stack_offsets
+};
+
+const struct rtos_register_stacking rtos_standard_cortex_m33_fpu_stacking = {
+	.stack_registers_size = 0xd0,
+	.stack_growth_direction = -1,
+	.num_output_registers = ARMV7M_NUM_CORE_REGS,
+	.calculate_process_stack = rtos_standard_cortex_m33_fpu_stack_align,
+	.register_offsets = rtos_standard_cortex_m33_fpu_stack_offsets
 };
 
 const struct rtos_register_stacking rtos_standard_cortex_r4_stacking = {
