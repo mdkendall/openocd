@@ -19,6 +19,7 @@
 #include "rtos_standard_stackings.h"
 #include "target/armv7m.h"
 #include "target/cortex_m.h"
+#include "target/register.h"
 
 #define FREERTOS_MAX_PRIORITIES	63
 #define FREERTOS_MAX_CORES		8
@@ -42,6 +43,16 @@ struct freertos_params {
 	const struct rtos_register_stacking *stacking_info_cm3;
 	const struct rtos_register_stacking *stacking_info_cm4f;
 	const struct rtos_register_stacking *stacking_info_cm4f_fpu;
+	const struct rtos_register_stacking *stacking_info_cm33;
+	const struct rtos_register_stacking *stacking_info_cm33_fpu;
+};
+
+/* Mutable per-session state: which SMP core index each current TCB is running on */
+struct freertos_state {
+	const struct freertos_params *params;
+	uint32_t current_tcbs[FREERTOS_MAX_CORES]; /* TCB pointer for each running core */
+	int num_cores;
+	bool smp_mode;
 };
 
 static const struct freertos_params freertos_params_list[] = {
@@ -56,9 +67,11 @@ static const struct freertos_params freertos_params_list[] = {
 	0,						/* thread_stack_offset; */
 	52,						/* thread_name_offset; */
 	64,						/* thread_name_offset_smp; */
-	&rtos_standard_cortex_m3_stacking,	/* stacking_info */
-	&rtos_standard_cortex_m4f_stacking,
-	&rtos_standard_cortex_m4f_fpu_stacking,
+	&rtos_standard_cortex_m3_stacking,		/* stacking_info_cm3 */
+	&rtos_standard_cortex_m4f_stacking,		/* stacking_info_cm4f */
+	&rtos_standard_cortex_m4f_fpu_stacking,	/* stacking_info_cm4f_fpu */
+	&rtos_standard_cortex_m33_stacking,		/* stacking_info_cm33 */
+	&rtos_standard_cortex_m33_fpu_stacking,	/* stacking_info_cm33_fpu */
 	},
 	{
 	"hla_target",			/* target_name */
@@ -71,9 +84,11 @@ static const struct freertos_params freertos_params_list[] = {
 	0,						/* thread_stack_offset; */
 	52,						/* thread_name_offset; */
 	64,						/* thread_name_offset_smp; */
-	&rtos_standard_cortex_m3_stacking,	/* stacking_info */
-	&rtos_standard_cortex_m4f_stacking,
-	&rtos_standard_cortex_m4f_fpu_stacking,
+	&rtos_standard_cortex_m3_stacking,		/* stacking_info_cm3 */
+	&rtos_standard_cortex_m4f_stacking,		/* stacking_info_cm4f */
+	&rtos_standard_cortex_m4f_fpu_stacking,	/* stacking_info_cm4f_fpu */
+	NULL,									/* stacking_info_cm33 (not applicable) */
+	NULL,									/* stacking_info_cm33_fpu (not applicable) */
 	},
 };
 
@@ -142,11 +157,13 @@ static int freertos_update_threads(struct rtos *rtos)
 	int retval;
 	unsigned int tasks_found = 0;
 	const struct freertos_params *param;
+	struct freertos_state *state;
 
 	if (!rtos->rtos_specific_params)
 		return -1;
 
-	param = (const struct freertos_params *) rtos->rtos_specific_params;
+	state = (struct freertos_state *) rtos->rtos_specific_params;
+	param = state->params;
 
 	if (!rtos->symbols) {
 		LOG_ERROR("No symbols for FreeRTOS");
@@ -229,6 +246,11 @@ static int freertos_update_threads(struct rtos *rtos)
 				rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
 				rtos->current_thread);
 	}
+
+	/* Cache running-task info for use in freertos_get_thread_reg_list */
+	state->smp_mode = smp_mode;
+	state->num_cores = num_cores;
+	memcpy(state->current_tcbs, current_tcbs, sizeof(current_tcbs));
 
 	/* read scheduler running */
 	uint32_t scheduler_running;
@@ -452,6 +474,7 @@ static int freertos_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 {
 	int retval;
 	const struct freertos_params *param;
+	struct freertos_state *state;
 	int64_t stack_ptr = 0;
 
 	if (!rtos)
@@ -463,9 +486,62 @@ static int freertos_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 	if (!rtos->rtos_specific_params)
 		return -1;
 
-	param = (const struct freertos_params *) rtos->rtos_specific_params;
+	state = (struct freertos_state *) rtos->rtos_specific_params;
+	param = state->params;
 
-	/* Read the stack pointer */
+	/* For currently-running tasks the TCB's saved stack is stale (the task has
+	 * not been context-switched out).  Read live hardware registers from the
+	 * corresponding SMP core instead. */
+	if (rtos->target->smp) {
+		struct target_list *head;
+		int core_idx = 0;
+		foreach_smp_target(head, rtos->target->smp_targets) {
+			if (core_idx < state->num_cores &&
+					state->current_tcbs[core_idx] == (uint32_t)thread_id) {
+				struct target *core_target = head->target;
+				int reg_list_size;
+				struct reg **hw_reg_list;
+				retval = target_get_gdb_reg_list(core_target, &hw_reg_list,
+						&reg_list_size, REG_CLASS_GENERAL);
+				if (retval != ERROR_OK)
+					break; /* fall through to saved-context path */
+				int j = 0;
+				for (int i = 0; i < reg_list_size; i++) {
+					if (!hw_reg_list[i] || !hw_reg_list[i]->exist ||
+							hw_reg_list[i]->hidden)
+						continue;
+					j++;
+				}
+				*num_regs = j;
+				*reg_list = calloc(*num_regs, sizeof(struct rtos_reg));
+				if (!*reg_list) {
+					free(hw_reg_list);
+					return ERROR_FAIL;
+				}
+				j = 0;
+				for (int i = 0; i < reg_list_size; i++) {
+					if (!hw_reg_list[i] || !hw_reg_list[i]->exist ||
+							hw_reg_list[i]->hidden)
+						continue;
+					if (!hw_reg_list[i]->valid)
+						hw_reg_list[i]->type->get(hw_reg_list[i]);
+					(*reg_list)[j].number = hw_reg_list[i]->number;
+					(*reg_list)[j].size = hw_reg_list[i]->size;
+					memcpy((*reg_list)[j].value, hw_reg_list[i]->value,
+							DIV_ROUND_UP(hw_reg_list[i]->size, 8));
+					j++;
+				}
+				free(hw_reg_list);
+				LOG_DEBUG("FreeRTOS: thread 0x%" PRIx64
+						" is running on core %d, using hardware registers",
+						thread_id, core_idx);
+				return ERROR_OK;
+			}
+			core_idx++;
+		}
+	}
+
+	/* Read the stack pointer from the TCB */
 	uint32_t pointer_casts_are_bad;
 	retval = target_read_u32(rtos->target,
 			thread_id + param->thread_stack_offset,
@@ -479,30 +555,61 @@ static int freertos_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 										thread_id + param->thread_stack_offset,
 										stack_ptr);
 
-	/* Check for armv7m with *enabled* FPU, i.e. a Cortex-M4F */
-	int cm4_fpu_enabled = 0;
+	/* Detect whether the target is ARMv8-M (Cortex-M33 etc.) using the cached
+	 * part number.  The RP2350 ARM_NTZ FreeRTOS port saves PSPLIM and EXC_RETURN
+	 * as the first two words of the software-saved context, so all register
+	 * offsets differ from the standard CM3/CM4F layout. */
+	bool is_armv8m = false;
+	enum cortex_m_impl_part impl_part = cortex_m_get_impl_part(rtos->target);
+	switch (impl_part) {
+	case CORTEX_M23_PARTNO:
+	case CORTEX_M33_PARTNO:
+	case CORTEX_M35P_PARTNO:
+	case CORTEX_M55_PARTNO:
+	case CORTEX_M85_PARTNO:
+		is_armv8m = true;
+		break;
+	default:
+		break;
+	}
+
+	/* Check for an enabled FPU */
+	int fpu_enabled = 0;
 	struct armv7m_common *armv7m_target = target_to_armv7m(rtos->target);
 	if (is_armv7m(armv7m_target)) {
 		if ((armv7m_target->fp_feature == FPV4_SP) || (armv7m_target->fp_feature == FPV5_SP) ||
 				(armv7m_target->fp_feature == FPV5_DP)) {
-			/* Found ARM v7m target which includes a FPU */
 			uint32_t cpacr;
-
 			retval = target_read_u32(rtos->target, FPU_CPACR, &cpacr);
 			if (retval != ERROR_OK) {
 				LOG_ERROR("Could not read CPACR register to check FPU state");
 				return -1;
 			}
-
-			/* Check if CP10 and CP11 are set to full access. */
-			if (cpacr & 0x00F00000) {
-				/* Found target with enabled FPU */
-				cm4_fpu_enabled = 1;
-			}
+			if (cpacr & 0x00F00000)
+				fpu_enabled = 1;
 		}
 	}
 
-	if (cm4_fpu_enabled == 1) {
+	if (is_armv8m && param->stacking_info_cm33) {
+		/* ARMv8-M (ARM_NTZ port): EXC_RETURN is at stack_ptr+0x04 (before r4-r11).
+		 * Use it to decide between basic and FPU-extended frame. */
+		if (fpu_enabled && param->stacking_info_cm33_fpu) {
+			uint32_t exc_return = 0;
+			retval = target_read_u32(rtos->target, stack_ptr + 0x04, &exc_return);
+			if (retval != ERROR_OK) {
+				LOG_OUTPUT("Error reading EXC_RETURN from FreeRTOS thread stack");
+				return retval;
+			}
+			if ((exc_return & 0x10) == 0)
+				return rtos_generic_stack_read(rtos->target,
+						param->stacking_info_cm33_fpu, stack_ptr, reg_list, num_regs);
+		}
+		return rtos_generic_stack_read(rtos->target,
+				param->stacking_info_cm33, stack_ptr, reg_list, num_regs);
+	}
+
+	/* Standard ARMv7-M (CM3/CM4F) path */
+	if (fpu_enabled) {
 		/* Read the LR to decide between stacking with or without FPU */
 		uint32_t lr_svc = 0;
 		retval = target_read_u32(rtos->target,
@@ -595,11 +702,18 @@ static bool freertos_detect_rtos(struct target *target)
 
 static int freertos_create(struct target *target)
 {
-	for (unsigned int i = 0; i < ARRAY_SIZE(freertos_params_list); i++)
+	for (unsigned int i = 0; i < ARRAY_SIZE(freertos_params_list); i++) {
 		if (strcmp(freertos_params_list[i].target_name, target_type_name(target)) == 0) {
-			target->rtos->rtos_specific_params = (void *)&freertos_params_list[i];
+			struct freertos_state *state = calloc(1, sizeof(*state));
+			if (!state) {
+				LOG_ERROR("Failed to allocate FreeRTOS state");
+				return ERROR_FAIL;
+			}
+			state->params = &freertos_params_list[i];
+			target->rtos->rtos_specific_params = state;
 			return ERROR_OK;
 		}
+	}
 
 	LOG_ERROR("Could not find target in FreeRTOS compatibility list");
 	return ERROR_FAIL;
