@@ -19,6 +19,7 @@
 #include "rtos_standard_stackings.h"
 #include "target/armv7m.h"
 #include "target/cortex_m.h"
+#include "target/register.h"
 
 #define FREERTOS_MAX_PRIORITIES	63
 #define FREERTOS_MAX_CORES		8
