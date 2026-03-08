@@ -228,8 +228,62 @@ static int freertos_update_threads(struct rtos *rtos)
 					i,
 					rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address + i * param->pointer_width,
 					tcb_ptr);
-			if (rtos->current_thread == 0 && tcb_ptr != 0)
-				rtos->current_thread = tcb_ptr;
+		}
+
+		/* Select the current_thread from whichever core caused the halt.
+		 * Use the same debug_reason priority as hwthread so that a
+		 * breakpoint/singlestep on core N is preferred over a core that
+		 * merely halted due to SMP propagation (DBGRQ). */
+		{
+			struct target_list *head;
+			int core_idx = 0;
+			enum target_debug_reason best_reason = DBG_REASON_UNDEFINED;
+			foreach_smp_target(head, rtos->target->smp_targets) {
+				struct target *curr = head->target;
+				if (core_idx < num_cores && current_tcbs[core_idx] != 0) {
+					bool update = false;
+					switch (best_reason) {
+					case DBG_REASON_UNDEFINED:
+						update = true;
+						break;
+					case DBG_REASON_SINGLESTEP:
+						if (curr->debug_reason == DBG_REASON_SINGLESTEP)
+							update = true;
+						break;
+					case DBG_REASON_BREAKPOINT:
+						if (curr->debug_reason == DBG_REASON_SINGLESTEP)
+							update = true;
+						break;
+					case DBG_REASON_WATCHPOINT:
+						if (curr->debug_reason == DBG_REASON_SINGLESTEP ||
+								curr->debug_reason == DBG_REASON_BREAKPOINT)
+							update = true;
+						break;
+					case DBG_REASON_DBGRQ:
+						if (curr->debug_reason == DBG_REASON_SINGLESTEP ||
+								curr->debug_reason == DBG_REASON_WATCHPOINT ||
+								curr->debug_reason == DBG_REASON_BREAKPOINT)
+							update = true;
+						break;
+					default:
+						break;
+					}
+					if (update) {
+						best_reason = curr->debug_reason;
+						rtos->current_thread = current_tcbs[core_idx];
+					}
+				}
+				core_idx++;
+			}
+			/* Fall back to first valid TCB if no core has a useful debug reason */
+			if (rtos->current_thread == 0) {
+				for (int i = 0; i < num_cores; i++) {
+					if (current_tcbs[i] != 0) {
+						rtos->current_thread = current_tcbs[i];
+						break;
+					}
+				}
+			}
 		}
 	} else {
 		/* Single-core: read pxCurrentTCB */
