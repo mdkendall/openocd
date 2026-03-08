@@ -20,6 +20,7 @@
 #include "target/armv7m.h"
 #include "target/cortex_m.h"
 #include "target/register.h"
+#include "server/gdb_server.h"
 
 #define FREERTOS_MAX_PRIORITIES	63
 #define FREERTOS_MAX_CORES		8
@@ -98,6 +99,8 @@ static int freertos_update_threads(struct rtos *rtos);
 static int freertos_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 		struct rtos_reg **reg_list, int *num_regs);
 static int freertos_get_symbol_list_to_lookup(struct symbol_table_elem *symbol_list[]);
+static int freertos_target_for_threadid(struct connection *connection,
+		int64_t thread_id, struct target **p_target);
 
 const struct rtos_type freertos_rtos = {
 	.name = "FreeRTOS",
@@ -742,6 +745,38 @@ static int freertos_get_thread_ascii_info(struct rtos *rtos, threadid_t thread_i
 
 #endif
 
+static int freertos_target_for_threadid(struct connection *connection,
+		int64_t thread_id, struct target **p_target)
+{
+	struct target *target = get_target_from_connection(connection);
+	*p_target = target;
+
+	if (!target->rtos || !target->rtos->rtos_specific_params)
+		return ERROR_OK;
+
+	struct freertos_state *state =
+		(struct freertos_state *)target->rtos->rtos_specific_params;
+
+	/* In SMP mode, map a currently-running task to its physical core so that
+	 * single-step and resume operations are directed to the correct hardware
+	 * thread.  Paused tasks have no associated core; leave them on the
+	 * primary target (the default). */
+	if (state->smp_mode && target->smp) {
+		struct target_list *head;
+		int core_idx = 0;
+		foreach_smp_target(head, target->smp_targets) {
+			if (core_idx < state->num_cores &&
+					state->current_tcbs[core_idx] == (uint32_t)thread_id) {
+				*p_target = head->target;
+				return ERROR_OK;
+			}
+			core_idx++;
+		}
+	}
+
+	return ERROR_OK;
+}
+
 static bool freertos_detect_rtos(struct target *target)
 {
 	if ((target->rtos->symbols) &&
@@ -765,6 +800,7 @@ static int freertos_create(struct target *target)
 			}
 			state->params = &freertos_params_list[i];
 			target->rtos->rtos_specific_params = state;
+			target->rtos->gdb_target_for_threadid = freertos_target_for_threadid;
 			return ERROR_OK;
 		}
 	}
