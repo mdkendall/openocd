@@ -3167,8 +3167,13 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			retval = target_poll(ct);
 			if (retval != ERROR_OK)
 				LOG_TARGET_DEBUG(ct, "error polling target after successful step");
-			/* send back signal information */
-			gdb_signal_reply(ct, connection);
+			/* send back signal information.
+			 * In SMP+RTOS mode ct may be a non-primary core that does not
+			 * have an rtos instance attached.  Always use the connection's
+			 * target (which owns the rtos) so that rtos_update_threads() is
+			 * called and the T stop packet includes the correct thread: field.
+			 * For single-core targets ct == target, so behaviour is unchanged. */
+			gdb_signal_reply(target, connection);
 			/* stop forwarding log packets! */
 			gdb_connection->output_flag = GDB_OUTPUT_NO;
 		} else
