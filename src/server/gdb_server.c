@@ -3174,6 +3174,15 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			 * called and the T stop packet includes the correct thread: field.
 			 * For single-core targets ct == target, so behaviour is unchanged. */
 			gdb_signal_reply(target, connection);
+			/* cortex_m_step() redirects gdb_service->target to the stepped
+			 * core so that halt events from that core are routed to GDB.  In
+			 * SMP+RTOS mode the RTOS lives on the primary target; restore
+			 * gdb_service->target so that all subsequent packet handlers use
+			 * the RTOS-aware primary target, not the bare physical core. */
+			if (ct != target) {
+				struct gdb_service *gdb_service = connection->service->priv;
+				gdb_service->target = target;
+			}
 			/* stop forwarding log packets! */
 			gdb_connection->output_flag = GDB_OUTPUT_NO;
 		} else
